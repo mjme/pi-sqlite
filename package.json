@@ -1,0 +1,53 @@
+{
+  "name": "pi-sqlite",
+  "version": "0.1.0",
+  "description": "Pi extension: run Pi as a SQLite-only agent with table-rendered query results",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mark Meyer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mjme/pi-sqlite.git"
+  },
+  "homepage": "https://github.com/mjme/pi-sqlite#readme",
+  "bugs": "https://github.com/mjme/pi-sqlite/issues",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "sqlite",
+    "sql",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "examples/make-sample-db.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "check": "tsc --noEmit",
+    "sample": "node examples/make-sample-db.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@types/node": "^26.6.6",
+    "typebox": "1.3.27",
+    "typescript": "^7.0.2"
+  }
+}
