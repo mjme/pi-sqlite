@@ -20,7 +20,7 @@ export interface FakePi {
 	emit(event: string, payload: any, ctx: any): Promise<unknown[]>;
 }
 
-export function createFakePi(opts: { flags?: Record<string, string>; activeTools?: string[] } = {}): FakePi {
+export function createFakePi(opts: { flags?: Record<string, string | boolean>; activeTools?: string[] } = {}): FakePi {
 	const fake: FakePi = {
 		pi: undefined as unknown as ExtensionAPI,
 		flags: {},

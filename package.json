@@ -1,6 +1,6 @@
 {
   "name": "pi-sqlite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension: run Pi as a SQLite-only agent with table-rendered query results",
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,7 @@
     "agent"
   ],
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=24.12.0"
   },
   "pi": {
     "extensions": [

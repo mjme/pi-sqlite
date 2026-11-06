@@ -108,3 +108,14 @@ test("fix: unknown details render nothing harmful instead of undefined", () => {
 	const lines = renderResultLines({} as ExecResult, 40, opts);
 	assert.ok(Array.isArray(lines));
 });
+
+test("security: escape sequences in cells, columns and errors never reach the terminal", () => {
+	const osc52 = "\x1b]52;c;cHduZWQ=\x07";
+	const csi = "\x9b31m";
+	const rows = renderResultLines(result({ columns: [`a${osc52}`], rows: [[`x${osc52}${csi}y`]], rowCount: 1 }), 80, opts);
+	const err = renderResultLines(result({ kind: "error", error: `no such table: x${osc52}\nsecond line` }), 80, opts);
+	for (const line of [...rows, ...err]) {
+		assert.doesNotMatch(line, /[\x1b\x07\x9b]/, JSON.stringify(line));
+	}
+	assert.ok(err.some((l) => l.includes("second line")));
+});

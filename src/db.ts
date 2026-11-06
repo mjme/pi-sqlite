@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
+import { assertSafetySupport, type HardenOptions, hardenDatabase, lastDenial, resetDenial } from "./security.ts";
 
 export type Cell = string | number | null;
 export type ExecKind = "rows" | "changes" | "script" | "error";
@@ -60,20 +61,50 @@ function loadSqlite(): SqliteModule {
 	}
 }
 
-export function openDatabase(absPath: string): { db: DatabaseSync; created: boolean } {
-	const created = absPath !== ":memory:" && !existsSync(absPath);
+export type OpenOptions = HardenOptions;
+
+/**
+ * Open a database with the safety policy applied (see security.ts). Read-only mode never creates
+ * a file. Throws when the file can't be opened or this Node.js lacks the safety APIs.
+ */
+export function openDatabase(absPath: string, opts: OpenOptions = {}): { db: DatabaseSync; created: boolean } {
+	const readOnly = opts.readOnly === true;
 	const { DatabaseSync } = loadSqlite();
-	const db = new DatabaseSync(absPath, { timeout: 5000 });
-	db.exec("PRAGMA foreign_keys = ON");
-	return { db, created };
+	assertSafetySupport(DatabaseSync.prototype);
+	const exists = absPath === ":memory:" || existsSync(absPath);
+	if (readOnly && !exists) throw new Error(`${absPath} does not exist (read-only mode doesn't create databases)`);
+	const db = new DatabaseSync(absPath, { timeout: 5000, readOnly });
+	try {
+		db.exec("PRAGMA foreign_keys = ON");
+		hardenDatabase(db, { readOnly, growthLimitBytes: opts.growthLimitBytes });
+	} catch (err) {
+		db.close();
+		throw err;
+	}
+	return { db, created: !exists };
 }
 
-/** Count top-level SQL statements, ignoring semicolons inside strings, identifiers and comments. */
-export function countStatements(sql: string): number {
-	let count = 0;
-	let hasContent = false;
-	let i = 0;
+export type SqlSegmentKind = "quoted" | "comment" | "semicolon" | "code";
+export interface SqlSegment {
+	kind: SqlSegmentKind;
+	text: string;
+}
+
+/**
+ * Split SQL into string/identifier literals, comments, semicolons and other code. Concatenating
+ * every segment's text gives back the input.
+ */
+export function scanSql(sql: string): SqlSegment[] {
+	const out: SqlSegment[] = [];
 	const len = sql.length;
+	let codeStart = 0;
+	let i = 0;
+	const push = (kind: SqlSegmentKind, start: number, end: number) => {
+		if (start > codeStart) out.push({ kind: "code", text: sql.slice(codeStart, start) });
+		out.push({ kind, text: sql.slice(start, end) });
+		codeStart = end;
+		i = end;
+	};
 	while (i < len) {
 		const c = sql[i];
 		const next = sql[i + 1];
@@ -89,29 +120,57 @@ export function countStatements(sql: string): number {
 				}
 				j++;
 			}
-			i = j + 1;
-			hasContent = true;
+			push("quoted", i, Math.min(len, j + 1));
 		} else if (c === "[") {
 			const j = sql.indexOf("]", i + 1);
-			i = j < 0 ? len : j + 1;
-			hasContent = true;
+			push("quoted", i, j < 0 ? len : j + 1);
 		} else if (c === "-" && next === "-") {
 			const j = sql.indexOf("\n", i);
-			i = j < 0 ? len : j + 1;
+			push("comment", i, j < 0 ? len : j);
 		} else if (c === "/" && next === "*") {
 			const j = sql.indexOf("*/", i + 2);
-			i = j < 0 ? len : j + 2;
+			push("comment", i, j < 0 ? len : j + 2);
 		} else if (c === ";") {
+			push("semicolon", i, i + 1);
+		} else {
+			i++;
+		}
+	}
+	if (len > codeStart) out.push({ kind: "code", text: sql.slice(codeStart) });
+	return out;
+}
+
+/** Count top-level SQL statements, ignoring semicolons inside strings, identifiers and comments. */
+export function countStatements(sql: string): number {
+	let count = 0;
+	let hasContent = false;
+	for (const seg of scanSql(sql)) {
+		if (seg.kind === "semicolon") {
 			if (hasContent) count++;
 			hasContent = false;
-			i++;
-		} else {
-			if (!/\s/.test(c)) hasContent = true;
-			i++;
+		} else if (seg.kind === "quoted" || (seg.kind === "code" && /\S/.test(seg.text))) {
+			hasContent = true;
 		}
 	}
 	if (hasContent) count++;
 	return count;
+}
+
+/** Remove SQL comments (text a database author controls, e.g. in CREATE statements) without touching literals. */
+export function stripSqlComments(sql: string): string {
+	const parts: string[] = [];
+	for (const seg of scanSql(sql)) {
+		if (seg.kind !== "comment") {
+			parts.push(seg.text);
+		} else if (seg.text.startsWith("--")) {
+			// Drop the spaces before a trailing line comment too; the newline after it is kept.
+			const prev = parts.length - 1;
+			if (prev >= 0 && !/^['"`[]/.test(parts[prev])) parts[prev] = parts[prev].replace(/[ \t]+$/, "");
+		} else {
+			parts.push(" ");
+		}
+	}
+	return parts.join("");
 }
 
 /** Cut a string to at most max UTF-16 units, ending in "…", without splitting a surrogate pair. */
@@ -209,6 +268,7 @@ export function execute(db: DatabaseSync, sql: string, maxRows: number = DETAILS
 		...r,
 		durationMs: Math.round((performance.now() - start) * 100) / 100,
 	});
+	resetDenial(db);
 	try {
 		const statements = countStatements(sql);
 		if (statements === 0) return done({ kind: "error", error: "No SQL statement to execute." });
@@ -249,6 +309,8 @@ export function execute(db: DatabaseSync, sql: string, maxRows: number = DETAILS
 			schemaChanged: ddl.length > 0,
 		});
 	} catch (err) {
-		return done({ kind: "error", error: err instanceof Error ? err.message : String(err) });
+		const denial = lastDenial(db);
+		const message = err instanceof Error ? err.message : String(err);
+		return done({ kind: "error", error: denial ? `Blocked by pi-sqlite: ${denial}` : message });
 	}
 }

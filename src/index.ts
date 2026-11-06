@@ -1,29 +1,34 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type ExecResult, execute, openDatabase } from "./db.ts";
+import { type ClientOptions, type SqliteClient, openClient } from "./client.ts";
+import type { ExecResult } from "./db.ts";
 import { formatForModel } from "./format.ts";
 import { MODE_ENTRY, type ModeEntryData, resolveDbPath } from "./mode.ts";
-import { type SchemaObject, formatSchema, readSchema, tableCount } from "./schema.ts";
-import { resultView, themeStyle } from "./table.ts";
+import { type SchemaObject, formatSchema, schemaHeader, tableCount } from "./schema.ts";
+import { resultView, sanitizeForTerminal, sanitizeLines, themeStyle } from "./table.ts";
 
 const FLAG = "sqlite-mode";
+const READONLY_FLAG = "sqlite-readonly";
 const TOOL = "sqlite";
 const STATUS_KEY = "sqlite";
 const SCHEMA_SECTION = "database_schema";
 const RESULT_MESSAGE = "sqlite-result";
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const NO_DB_MESSAGE = "No SQLite database is open. Start pi with --sqlite-mode <path/to/database.db>.";
+const ONLY_SQLITE = "Only the sqlite tool is available in SQL mode.";
 
 interface State {
-	db?: DatabaseSync;
+	client?: SqliteClient;
 	path?: string;
+	readOnly: boolean;
 	schema: SchemaObject[];
 	persona: string;
 	openError?: string;
+	/** Bumped on every open/close so a slow open from an earlier session can't install itself. */
+	generation: number;
 }
 
 /** Read src/system-prompt.md, dropping the leading HTML comment meant for humans editing the file. */
@@ -53,36 +58,44 @@ function linesView(lines: string[]): Component {
 	};
 }
 
-export default function piSqlite(pi: ExtensionAPI): void {
-	const state: State = { schema: [], persona: "" };
+/** The extension factory. `options` exists for tests (e.g. a short query timeout). */
+export default function piSqlite(pi: ExtensionAPI, options: ClientOptions = {}): void {
+	const state: State = { schema: [], persona: "", readOnly: false, generation: 0 };
+
+	const dbLabel = () => sanitizeForTerminal(basename(state.path ?? "")) + (state.readOnly ? " (read-only)" : "");
 
 	const statusText = () => {
 		const tables = tableCount(state.schema);
-		return `sqlite: ${basename(state.path ?? "")} · ${tables} ${tables === 1 ? "table" : "tables"}`;
+		return `sqlite: ${dbLabel()} · ${tables} ${tables === 1 ? "table" : "tables"}`;
 	};
 
-	const refreshSchema = (ctx: ExtensionContext) => {
-		if (!state.db) return;
-		state.schema = readSchema(state.db);
+	const refreshSchema = async (ctx: ExtensionContext) => {
+		const client = state.client;
+		if (!client) return;
+		try {
+			const schema = await client.schema();
+			if (state.client !== client) return;
+			state.schema = schema;
+		} catch {
+			// e.g. the schema read timed out: keep the previous schema
+		}
 		ctx.ui.setStatus(STATUS_KEY, statusText());
 	};
 
 	const closeDb = (ctx: ExtensionContext) => {
-		const wasOpen = state.db !== undefined || state.path !== undefined;
-		try {
-			state.db?.close();
-		} catch {
-			// already closed
-		}
-		state.db = undefined;
+		const wasOpen = state.client !== undefined || state.path !== undefined;
+		state.generation++;
+		state.client?.close();
+		state.client = undefined;
 		state.path = undefined;
+		state.readOnly = false;
 		state.schema = [];
 		state.openError = undefined;
 		if (wasOpen) ctx.ui.setStatus(STATUS_KEY, undefined);
 	};
 
-	const enterMode = (ctx: ExtensionContext) => {
-		const resolved = resolveDbPath(pi.getFlag(FLAG), ctx.cwd, ctx.sessionManager.getBranch());
+	const enterMode = async (ctx: ExtensionContext) => {
+		const resolved = resolveDbPath(pi.getFlag(FLAG), ctx.cwd, ctx.sessionManager.getBranch(), pi.getFlag(READONLY_FLAG));
 		if (!resolved) {
 			closeDb(ctx);
 			const active = pi.getActiveTools();
@@ -94,44 +107,66 @@ export default function piSqlite(pi: ExtensionAPI): void {
 		}
 
 		closeDb(ctx);
+		const generation = state.generation;
 		state.path = resolved.path;
+		state.readOnly = resolved.readOnly;
 		state.persona = readPersona();
-		try {
-			const { db, created } = openDatabase(resolved.path);
-			state.db = db;
-			state.schema = readSchema(db);
-			if (created && ctx.hasUI) ctx.ui.notify(`Created new database ${resolved.path}`, "info");
-		} catch (err) {
-			try {
-				state.db?.close();
-			} catch {}
-			state.db = undefined;
-			state.openError = `Could not open ${resolved.path}: ${err instanceof Error ? err.message : String(err)}`;
-			if (ctx.hasUI) ctx.ui.notify(state.openError, "error");
-			else console.error(`pi-sqlite: ${state.openError}`);
+		// Lock the tools down before anything slow happens.
+		if (!resolved.persisted) {
+			pi.appendEntry<ModeEntryData>(MODE_ENTRY, { path: resolved.path, ...(resolved.readOnly ? { readOnly: true } : {}) });
 		}
-		if (!resolved.persisted) pi.appendEntry<ModeEntryData>(MODE_ENTRY, { path: resolved.path });
 		pi.setActiveTools([TOOL]);
-		ctx.ui.setStatus(STATUS_KEY, state.db ? statusText() : `sqlite: ${basename(resolved.path)} · not open`);
+		const warn = (message: string, type: "info" | "warning" | "error") => {
+			if (ctx.hasUI) ctx.ui.notify(message, type);
+			else if (type !== "info") console.error(`pi-sqlite: ${message}`);
+		};
+		try {
+			const opened = await openClient({ path: resolved.path, readOnly: resolved.readOnly }, options);
+			if (state.generation !== generation) {
+				opened.client.close();
+				return;
+			}
+			state.client = opened.client;
+			state.schema = await opened.client.schema();
+			if (opened.created) warn(`Created new database ${resolved.path}`, "info");
+			if (opened.fallbackReason) {
+				warn(`pi-sqlite: running queries inside Pi (${opened.fallbackReason}); long queries can't be cancelled.`, "warning");
+			}
+		} catch (err) {
+			if (state.generation !== generation) return;
+			state.client?.close();
+			state.client = undefined;
+			state.openError = `Could not open ${resolved.path}: ${err instanceof Error ? err.message : String(err)}`;
+			warn(state.openError, "error");
+		}
+		ctx.ui.setStatus(STATUS_KEY, state.client ? statusText() : `sqlite: ${dbLabel()} · not open`);
 	};
 
 	pi.registerFlag(FLAG, {
 		type: "string",
 		description: "Open a SQLite database and run Pi as a SQL-only agent",
 	});
+	pi.registerFlag(READONLY_FLAG, {
+		type: "boolean",
+		description: "With --sqlite-mode: open the database read-only so the agent can't change it",
+	});
 
 	pi.on("session_start", (_event, ctx) => enterMode(ctx));
 	pi.on("session_tree", (_event, ctx) => enterMode(ctx));
 	pi.on("session_shutdown", (_event, ctx) => closeDb(ctx));
+
+	// Pi activates tools that register late (e.g. MCP servers that finish connecting mid-run).
+	// before_agent_start resets the tool list each prompt; this blocks anything else in between.
+	pi.on("tool_call", (event) => (state.path && event.toolName !== TOOL ? { block: true, reason: ONLY_SQLITE } : undefined));
 
 	pi.on("before_agent_start", (event) => {
 		if (!state.path) return;
 		const o = event.systemPromptOptions;
 		const prev = o.customPrompt;
 		if (!prev?.startsWith(state.persona)) o.customPrompt = prev ? `${state.persona}\n\n${prev}` : state.persona;
-		o.sections[SCHEMA_SECTION] = state.db
-			? formatSchema(state.path, state.schema)
-			: `Database: ${state.path}\n${state.openError ?? NO_DB_MESSAGE}`;
+		o.sections[SCHEMA_SECTION] = state.client
+			? formatSchema(state.path, state.schema, { readOnly: state.readOnly })
+			: `${schemaHeader(state.path, state.readOnly)}\n${state.openError ?? NO_DB_MESSAGE}`;
 		o.selectedTools = [TOOL];
 	});
 
@@ -139,7 +174,8 @@ export default function piSqlite(pi: ExtensionAPI): void {
 		description: "Run SQL directly against the open database (result is shared with the model)",
 		handler: async (args, ctx) => {
 			const sql = args.trim();
-			if (!state.db) {
+			const client = state.client;
+			if (!client) {
 				ctx.ui.notify(state.openError ?? NO_DB_MESSAGE, "warning");
 				return;
 			}
@@ -147,8 +183,8 @@ export default function piSqlite(pi: ExtensionAPI): void {
 				ctx.ui.notify("Usage: /sql <statement>", "info");
 				return;
 			}
-			const r = execute(state.db, sql);
-			if (changesData(r)) refreshSchema(ctx);
+			const r = await client.exec(sql);
+			if (changesData(r)) await refreshSchema(ctx);
 			// triggerTurn: false appends now when idle, or at the end of the current turn when busy.
 			pi.sendMessage<ExecResult>(
 				{ customType: RESULT_MESSAGE, content: formatForModel(r), display: true, details: r },
@@ -159,7 +195,7 @@ export default function piSqlite(pi: ExtensionAPI): void {
 
 	pi.registerMessageRenderer<ExecResult>(RESULT_MESSAGE, (message, options, theme) => {
 		if (!isExecResult(message.details)) return undefined;
-		const sql = message.details.sql.trim().split("\n")[0];
+		const sql = sanitizeForTerminal(message.details.sql.trim().split("\n")[0]);
 		const header = linesView([theme.fg("toolTitle", theme.bold("/sql ")) + theme.fg("muted", sql)]);
 		const table = resultView(message.details, {
 			expanded: options.expanded,
@@ -192,8 +228,9 @@ export default function piSqlite(pi: ExtensionAPI): void {
 		parameters: SqliteParams,
 		defaultActive: false,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!state.db) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const client = state.client;
+			if (!client) {
 				const text = state.openError ? `${state.openError}\n${NO_DB_MESSAGE}` : NO_DB_MESSAGE;
 				const details: ExecResult = {
 					sql: params.sql,
@@ -209,8 +246,8 @@ export default function piSqlite(pi: ExtensionAPI): void {
 				};
 				return { content: [{ type: "text", text }], details, isError: true };
 			}
-			const r = execute(state.db, params.sql);
-			if (changesData(r)) refreshSchema(ctx);
+			const r = await client.exec(params.sql, signal);
+			if (changesData(r)) await refreshSchema(ctx);
 			return {
 				content: [{ type: "text", text: formatForModel(r) }],
 				details: r,
@@ -219,18 +256,16 @@ export default function piSqlite(pi: ExtensionAPI): void {
 		},
 
 		renderCall(args, theme, context) {
-			const sql = String(args?.sql ?? "").trim();
+			// The SQL comes from the model, which may have copied it from untrusted data.
+			const lines = sanitizeLines(String(args?.sql ?? "").trim());
 			const title = theme.fg("toolTitle", theme.bold("sqlite "));
 			if (context.expanded) {
 				return {
 					render: (width: number) =>
-						[title, ...sql.split("\n").map((l) => `  ${theme.fg("muted", l)}`)].flatMap((l) =>
-							wrapTextWithAnsi(l, Math.max(1, width)),
-						),
+						[title, ...lines.map((l) => `  ${theme.fg("muted", l)}`)].flatMap((l) => wrapTextWithAnsi(l, Math.max(1, width))),
 					invalidate() {},
 				};
 			}
-			const lines = sql.split("\n");
 			const first = lines[0] + (lines.length > 1 ? " …" : "");
 			return linesView([title + theme.fg("muted", first)]);
 		},
@@ -245,8 +280,7 @@ export default function piSqlite(pi: ExtensionAPI): void {
 				const color = context.isError || (result as { isError?: boolean }).isError ? "error" : "toolOutput";
 				return {
 					render: (width: number) =>
-						text
-							.split("\n")
+						sanitizeLines(text)
 							.flatMap((l) => wrapTextWithAnsi(l, Math.max(1, width)))
 							.map((l) => truncateToWidth(theme.fg(color, l), Math.max(1, width), "…")),
 					invalidate() {},

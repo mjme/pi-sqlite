@@ -6,6 +6,8 @@ A [Pi](https://pi.dev) extension that turns Pi into a **SQLite agent**. Point it
 pi --sqlite-mode ./music.db
 ```
 
+> **Heads up:** the agent can change and delete data in your database without asking. Add `--sqlite-readonly` (or point it at a copy) if you only want to read.
+
 ```
  sqlite SELECT name, country FROM artists LIMIT 5
  name                │ country
@@ -28,7 +30,8 @@ When you start Pi with `--sqlite-mode <path>`:
 - **Small context.** The model sees at most 50 rows (about 8 KB) per result, plus a note saying how many rows were left out. The full rows (up to 500) are only drawn on your screen.
 - **`/sql` command.** Type `/sql SELECT …` to run SQL yourself. The result renders the same way and is also added to the conversation, so you can follow up with "why are so many of those NULL?"
 - **Status bar.** The footer shows `sqlite: music.db · 4 tables`.
-- **Sessions remember their database.** Resume a SQL session with `pi -c` (no flag needed) and it reopens the same database.
+- **Sessions remember their database.** Resume a SQL session with `pi -c` (no flag needed) and it reopens the same database, read-only if it was before.
+- **Read-only mode.** `pi --sqlite-mode ./music.db --sqlite-readonly` opens the database read-only: queries work, writes fail, and a missing file is never created. Pi reads the word after a flag as its value, so don't put `--sqlite-readonly` directly before your prompt.
 
 Without the flag, the extension does nothing: plain `pi` keeps its normal tools and prompt.
 
@@ -36,7 +39,7 @@ If the path doesn't exist, a new empty database is created there.
 
 ## Install
 
-Requires Pi and Node.js 22.19 or newer (Pi's own minimum). There are no other dependencies: the extension uses Node's built-in `node:sqlite`.
+Requires Pi and Node.js 24.12 or newer, which is newer than Pi's own minimum: the safety checks need `node:sqlite`'s authorizer. On older Node.js the extension refuses to open a database. There are no other dependencies.
 
 ```bash
 pi install git:github.com/mjme/pi-sqlite
@@ -58,7 +61,11 @@ The schema is appended automatically, so don't paste it into that file. If you u
 
 ## Notes
 
-- Writes are allowed and not confirmed. Point it at a copy if you're nervous.
+- Writes are allowed and not confirmed unless you use `--sqlite-readonly`.
+- The agent can only reach the opened database: `ATTACH`, `VACUUM INTO`, `load_extension()` and PRAGMAs that touch files or can corrupt the database are blocked, for `/sql` too.
+- Queries run in a separate process. One that runs longer than 30 seconds is stopped, Esc cancels one, and a write that was cut off is rolled back.
+- The database can grow by at most 1 GiB per session, so a runaway query can't fill the disk.
+- Query results are sent to your model provider and saved in Pi's session files, like any other tool output.
 - Several statements in one call (`CREATE …; INSERT …;`) run as a script and return no rows. Send one statement when you want rows back.
 - Big integers beyond JavaScript's safe range are shown as text, and BLOBs as `<blob N bytes>`.
 
@@ -77,6 +84,9 @@ Source layout:
 | `src/index.ts` | Pi wiring: flag, tool, `/sql`, renderers, prompt, status |
 | `src/system-prompt.md` | The agent persona (edit me) |
 | `src/db.ts` | Opening the database and running SQL |
+| `src/security.ts` | The SQL safety policy (authorizer, defensive mode, growth cap) |
+| `src/client.ts` | Runs SQL in a separate process that can be killed (timeouts, Esc) |
+| `src/host/` | The query process: a small loader and the request loop |
 | `src/schema.ts` | Reading and formatting the schema for the prompt |
 | `src/format.ts` | The capped text the model sees |
 | `src/table.ts` | The terminal table renderer |

@@ -41,7 +41,7 @@ test("formatSchema falls back to compact form within the byte cap", () => {
 	const { db } = openDatabase(":memory:");
 	const cols = Array.from({ length: 10 }, (_, i) => `column_number_${i} text`).join(", ");
 	for (let t = 0; t < 200; t++) db.exec(`create table table_${t}(${cols})`);
-	const text = formatSchema("/x/wide.db", readSchema(db), 8192);
+	const text = formatSchema("/x/wide.db", readSchema(db), { maxBytes: 8192 });
 	assert.ok(Buffer.byteLength(text) <= 8192, `got ${Buffer.byteLength(text)} bytes`);
 	assert.match(text, /table_0\(column_number_0 TEXT, /);
 	assert.match(text, /sqlite_schema/);

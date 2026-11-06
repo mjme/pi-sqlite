@@ -37,12 +37,26 @@ export interface ResultViewOptions {
 const n = (v: number) => v.toLocaleString("en-US");
 const rowsWord = (v: number) => `${n(v)} ${v === 1 ? "row" : "rows"}`;
 
-function cellText(cell: Cell): string {
-	if (cell === null) return "NULL";
-	return String(cell)
+/**
+ * Make untrusted text safe to draw on one terminal line: newlines become ⏎, tabs spaces, and every
+ * other C0/C1 control character (ESC, BEL, CSI, …) becomes �, so data can't send escape sequences
+ * (clipboard writes, title changes, hyperlinks) to the terminal.
+ */
+export function sanitizeForTerminal(text: string): string {
+	return text
 		.replace(/\r?\n/g, "⏎")
 		.replace(/\t/g, " ")
-		.replace(/[\x00-\x1f\x7f]/g, "�");
+		.replace(/[\x00-\x1f\x7f-\x9f]/g, "�");
+}
+
+/** sanitizeForTerminal for multi-line text: one sanitized string per line. */
+export function sanitizeLines(text: string): string[] {
+	return text.split(/\r?\n/).map(sanitizeForTerminal);
+}
+
+function cellText(cell: Cell): string {
+	if (cell === null) return "NULL";
+	return sanitizeForTerminal(String(cell));
 }
 
 function columnWidths(header: string[], body: string[][], width: number): number[] {
@@ -73,10 +87,11 @@ function rowsLines(r: ExecResult, width: number, o: ResultViewOptions): string[]
 	const { style } = o;
 	const visible = o.expanded ? r.rows : r.rows.slice(0, COLLAPSED_ROWS);
 	const body = visible.map((row) => row.map(cellText));
-	const widths = columnWidths(r.columns, body, width);
+	const header = r.columns.map((c) => cellText(c));
+	const widths = columnWidths(header, body, width);
 	const sep = style.border(SEPARATOR);
 	const lines: string[] = [];
-	lines.push(r.columns.map((c, i) => style.header(fit(cellText(c), widths[i], false))).join(sep));
+	lines.push(header.map((c, i) => style.header(fit(c, widths[i], false))).join(sep));
 	lines.push(style.border(widths.map((w) => "─".repeat(w)).join("─┼─")));
 	visible.forEach((row, ri) => {
 		lines.push(
@@ -118,7 +133,9 @@ export function renderResultLines(r: ExecResult, width: number, o: ResultViewOpt
 		case "script":
 			return [style.success(`✓ script executed (${r.statements ?? 0} statements)`), ...(r.schemaChanged ? [style.dim("schema updated")] : [])].map((l) => fitLine(l, width));
 		case "error":
-			return wrapTextWithAnsi(`✗ ${r.error ?? "unknown error"}`, Math.max(1, width)).map((l) => fitLine(style.error(l), width));
+			return sanitizeLines(`✗ ${r.error ?? "unknown error"}`)
+				.flatMap((l) => wrapTextWithAnsi(l, Math.max(1, width)))
+				.map((l) => fitLine(style.error(l), width));
 		default:
 			return [];
 	}
